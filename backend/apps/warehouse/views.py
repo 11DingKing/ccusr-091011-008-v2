@@ -10,14 +10,23 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    StockLedgerEntry, Investigation,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    StockLedgerEntrySerializer,
+    InvestigationSerializer, InvestigationOpenSerializer,
+    InvestigationRecordSerializer, InvestigationDecisionSerializer,
+    InvestigationReverseSerializer, StockMovementSerializer,
 )
+from . import services
+from .services import WorkflowError
 
 logger = logging.getLogger('apps')
 
@@ -561,78 +570,330 @@ class VarietyImportView(APIView):
         )
 
 
-# ==================== 其他视图占位 ====================
+# ==================== 货物 / 收发 / 预警 / 审批 ====================
 
 class DashboardView(APIView):
     """仪表盘视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'message': '仪表盘功能开发中...'
         })
 
 
+def _paginate(request, queryset):
+    page = int(request.query_params.get('page', 1))
+    page_size = int(request.query_params.get('page_size', 10))
+    start = (page - 1) * page_size
+    return page, page_size, queryset.count(), queryset[start:start + page_size]
+
+
 class GoodsListView(APIView):
     """货物列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety__category__unit'
+        ).filter(is_active=True).order_by('-created_at')
+        page, page_size, total, goods = _paginate(request, queryset)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': GoodsSerializer(goods, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class StockInListView(APIView):
-    """入库记录列表视图"""
+    """入库记录：GET 列表 / POST 登记入库（过流水、更新库存）"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator').order_by('-stock_in_time')
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        page, page_size, total, rows = _paginate(request, queryset)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockInSerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
+
+    def post(self, request):
+        goods_id = request.data.get('goods')
+        try:
+            goods = Goods.objects.get(pk=goods_id)
+        except (Goods.DoesNotExist, TypeError, ValueError):
+            return error_response(message='货物不存在')
+        serializer = StockMovementSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        try:
+            stock_in, _ = services.receive_goods(
+                goods.id, data['quantity'], operator=request.user,
+                batch_no=data.get('batch_no', ''), supplier=data.get('supplier', ''),
+                remark=data.get('remark', ''),
+            )
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} stocked in {stock_in.quantity} of goods {goods.id}")
+        return success_response(data=StockInSerializer(stock_in).data, message='入库成功')
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库记录：GET 列表 / POST 登记出库（过流水、更新库存）"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator').order_by('-created_at')
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        page, page_size, total, rows = _paginate(request, queryset)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockOutSerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        goods_id = request.data.get('goods')
+        try:
+            goods = Goods.objects.get(pk=goods_id)
+        except (Goods.DoesNotExist, TypeError, ValueError):
+            return error_response(message='货物不存在')
+        serializer = StockMovementSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        if not data.get('receiver'):
+            return error_response(message='请填写领用人')
+        try:
+            stock_out, _ = services.issue_goods(
+                goods.id, data['quantity'], operator=request.user,
+                receiver=data.get('receiver', ''), receiver_dept=data.get('receiver_dept', ''),
+                remark=data.get('remark', ''),
+            )
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} issued {stock_out.quantity} of goods {goods.id}")
+        return success_response(data=StockOutSerializer(stock_out).data, message='出库成功')
+
+
+class StockLedgerView(APIView):
+    """库存流水分录查询（按货物）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, goods_id):
+        if not Goods.objects.filter(pk=goods_id).exists():
+            return error_response(message='货物不存在', code=404)
+        queryset = StockLedgerEntry.objects.filter(goods_id=goods_id).order_by('-id')
+        page, page_size, total, rows = _paginate(request, queryset)
+        return success_response(data={
+            'list': StockLedgerEntrySerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Warning.objects.select_related('goods').order_by('-created_at')
+        page, page_size, total, rows = _paginate(request, queryset)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': WarningSerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Approval.objects.select_related('stock_out', 'approver').order_by('-created_at')
+        page, page_size, total, rows = _paginate(request, queryset)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': ApprovalSerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
+
+
+# ==================== 盘点差异调查单 ====================
+
+class InvestigationListView(APIView):
+    """调查单列表 / 立案"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = Investigation.objects.select_related(
+            'goods', 'created_by', 'approver'
+        ).prefetch_related('records').order_by('-created_at')
+        status = request.query_params.get('status')
+        goods_id = request.query_params.get('goods')
+        if status:
+            queryset = queryset.filter(status=status)
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        page, page_size, total, rows = _paginate(request, queryset)
+        return success_response(data={
+            'list': InvestigationSerializer(rows, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        serializer = InvestigationOpenSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        try:
+            investigation = services.open_investigation(
+                goods_id=data['goods'],
+                counted_quantity=data['counted_quantity'],
+                responsibility_scope=data['responsibility_scope'],
+                user=request.user,
+                responsible_person=data.get('responsible_person', ''),
+                location_scope=data.get('location_scope', ''),
+                remark=data.get('remark', ''),
+            )
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(
+            f"User {request.user.username} opened investigation {investigation.code} "
+            f"for goods {investigation.goods_id}"
+        )
+        return success_response(
+            data=InvestigationSerializer(investigation).data, message='立案成功'
+        )
+
+
+class InvestigationDetailView(APIView):
+    """调查单详情"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            investigation = Investigation.objects.select_related(
+                'goods', 'created_by', 'approver', 'reversed_by',
+                'adjustment_entry', 'reversal_entry',
+            ).prefetch_related('records__author').get(pk=pk)
+        except Investigation.DoesNotExist:
+            return error_response(message='调查单不存在', code=404)
+        return success_response(data=InvestigationSerializer(investigation).data)
+
+
+class InvestigationRecordView(APIView):
+    """追加调查记录（原因/证据/复核意见），只追加不可改"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not Investigation.objects.filter(pk=pk).exists():
+            return error_response(message='调查单不存在', code=404)
+        kind = request.data.get('kind')
+        content = request.data.get('content', '')
+        attachment_ref = request.data.get('attachment_ref', '')
+        try:
+            record = services.add_record(
+                investigation_id=pk, kind=kind, content=content,
+                user=request.user, attachment_ref=attachment_ref,
+            )
+        except (WorkflowError, Investigation.DoesNotExist) as exc:
+            message = str(exc) if isinstance(exc, WorkflowError) else '调查单不存在'
+            return error_response(message=message)
+        return success_response(
+            data=InvestigationRecordSerializer(record).data, message='记录已追加'
+        )
+
+
+class InvestigationApproveView(APIView):
+    """批准结案：检测基线、重算差额、过独立调整分录"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = InvestigationDecisionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=str(list(serializer.errors.values())[0][0]))
+        try:
+            investigation = services.approve_investigation(
+                investigation_id=pk,
+                approver=request.user,
+                opinion=serializer.validated_data.get('opinion', ''),
+            )
+        except Investigation.DoesNotExist:
+            return error_response(message='调查单不存在', code=404)
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} approved investigation {pk}")
+        return success_response(
+            data=InvestigationSerializer(investigation).data, message='已批准并完成调整'
+        )
+
+
+class InvestigationRejectView(APIView):
+    """驳回结案：不作调整"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = InvestigationDecisionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=str(list(serializer.errors.values())[0][0]))
+        try:
+            investigation = services.reject_investigation(
+                investigation_id=pk, approver=request.user,
+                opinion=serializer.validated_data.get('opinion', ''),
+            )
+        except Investigation.DoesNotExist:
+            return error_response(message='调查单不存在', code=404)
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} rejected investigation {pk}")
+        return success_response(
+            data=InvestigationSerializer(investigation).data, message='已驳回'
+        )
+
+
+class InvestigationReverseView(APIView):
+    """撤销批准：追加冲回分录，旧记录保留"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = InvestigationReverseSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=str(list(serializer.errors.values())[0][0]))
+        try:
+            investigation = services.reverse_investigation(
+                investigation_id=pk, user=request.user,
+                reason=serializer.validated_data['reason'],
+            )
+        except Investigation.DoesNotExist:
+            return error_response(message='调查单不存在', code=404)
+        except WorkflowError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} reversed investigation {pk}")
+        return success_response(
+            data=InvestigationSerializer(investigation).data, message='已撤销，调整已冲回'
+        )
+
+
+class InvestigationReconstructionView(APIView):
+    """还原发现值、系统值、后续变动与实际调整之间的关系"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            investigation = Investigation.objects.select_related(
+                'goods', 'adjustment_entry', 'reversal_entry'
+            ).get(pk=pk)
+        except Investigation.DoesNotExist:
+            return error_response(message='调查单不存在', code=404)
+        data = investigation.reconstruction()
+        data['interim_entries'] = StockLedgerEntrySerializer(
+            investigation.interim_entries().order_by('id'), many=True
+        ).data
+        return success_response(data=data)
