@@ -2,7 +2,11 @@
 仓库管理序列化器
 """
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from apps.authentication.models import User
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    StocktakeInvestigation, InvestigationNote, StockAdjustment,
+)
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -193,10 +197,129 @@ class ApprovalSerializer(serializers.ModelSerializer):
     """审批记录序列化器"""
     approver_name = serializers.CharField(source='approver.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = Approval
         fields = [
             'id', 'stock_out', 'approver', 'approver_name',
             'status', 'status_display', 'remark', 'created_at', 'updated_at'
         ]
+
+
+# ==================== 盘点差异调查 ====================
+
+class InvestigationNoteSerializer(serializers.ModelSerializer):
+    """调查过程记录序列化器"""
+    type_display = serializers.CharField(source='get_type_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = InvestigationNote
+        fields = [
+            'id', 'type', 'type_display', 'content',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+
+
+class InvestigationNoteCreateSerializer(serializers.Serializer):
+    """调查过程记录创建序列化器"""
+    type = serializers.ChoiceField(
+        choices=['reason', 'evidence', 'review'], required=True,
+        error_messages={
+            'required': '请选择记录类型',
+            'invalid_choice': '记录类型无效，应为 reason/evidence/review',
+        }
+    )
+    content = serializers.CharField(required=True, allow_blank=False, error_messages={
+        'required': '请填写记录内容',
+        'blank': '记录内容不能为空',
+    })
+
+
+class StockAdjustmentSerializer(serializers.ModelSerializer):
+    """库存调整分录序列化器"""
+    type_display = serializers.CharField(source='get_type_display', read_only=True)
+    operator_name = serializers.CharField(source='operator.username', read_only=True)
+
+    class Meta:
+        model = StockAdjustment
+        fields = [
+            'id', 'type', 'type_display', 'quantity',
+            'before_quantity', 'after_quantity', 'reverses',
+            'operator', 'operator_name', 'remark', 'created_at'
+        ]
+
+
+class InvestigationSerializer(serializers.ModelSerializer):
+    """盘点差异调查单序列化器"""
+    goods_name = serializers.CharField(source='goods.name', read_only=True)
+    goods_code = serializers.CharField(source='goods.code', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    difference = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
+    responsible_user_name = serializers.CharField(source='responsible_user.username', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    closed_by_name = serializers.CharField(source='closed_by.username', read_only=True)
+    revoked_by_name = serializers.CharField(source='revoked_by.username', read_only=True)
+    notes = InvestigationNoteSerializer(many=True, read_only=True)
+    adjustments = StockAdjustmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = StocktakeInvestigation
+        fields = [
+            'id', 'order_no', 'goods', 'goods_name', 'goods_code',
+            'responsible_user', 'responsible_user_name', 'responsible_dept',
+            'snapshot_quantity', 'counted_quantity', 'difference', 'snapshot_at',
+            'status', 'status_display', 'conclusion',
+            'close_baseline_quantity', 'baseline_changed',
+            'cancel_reason', 'revoke_reason',
+            'created_by', 'created_by_name', 'created_at',
+            'closed_by', 'closed_by_name', 'closed_at',
+            'revoked_by', 'revoked_by_name', 'revoked_at',
+            'notes', 'adjustments',
+        ]
+
+
+class InvestigationCreateSerializer(serializers.Serializer):
+    """盘点差异调查单创建序列化器"""
+    goods_id = serializers.IntegerField(required=True, error_messages={
+        'required': '请选择货物',
+    })
+    counted_quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=0, required=True,
+        error_messages={'required': '请填写实盘数量'}
+    )
+    responsible_user_id = serializers.IntegerField(required=False, allow_null=True)
+    responsible_dept = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+
+    def validate_goods_id(self, value):
+        if not Goods.objects.filter(pk=value, is_active=True).exists():
+            raise serializers.ValidationError('货物不存在或已停用')
+        return value
+
+    def validate_responsible_user_id(self, value):
+        if value is not None and not User.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('责任人不存在')
+        return value
+
+
+class InvestigationCloseSerializer(serializers.Serializer):
+    """调查单结案序列化器"""
+    conclusion = serializers.CharField(required=True, allow_blank=False, error_messages={
+        'required': '请填写调查结论',
+        'blank': '调查结论不能为空',
+    })
+
+
+class InvestigationRevokeSerializer(serializers.Serializer):
+    """调查单撤销序列化器"""
+    reason = serializers.CharField(required=True, allow_blank=False, error_messages={
+        'required': '请填写撤销原因',
+        'blank': '撤销原因不能为空',
+    })
+
+
+class InvestigationCancelSerializer(serializers.Serializer):
+    """调查单作废序列化器"""
+    reason = serializers.CharField(required=False, allow_blank=True, default='')

@@ -217,6 +217,137 @@ class Warning(models.Model):
         return f"{self.goods.name} - {self.get_type_display()}"
 
 
+class StocktakeInvestigation(models.Model):
+    """盘点差异调查单模型"""
+    STATUS_CHOICES = [
+        ('investigating', '调查中'),
+        ('closed', '已结案'),
+        ('revoked', '已撤销'),
+        ('cancelled', '已作废'),
+    ]
+
+    order_no = models.CharField('调查单号', max_length=32, unique=True)
+    goods = models.ForeignKey(
+        Goods, on_delete=models.PROTECT,
+        related_name='stocktake_investigations', verbose_name='货物'
+    )
+    responsible_user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='responsible_investigations', verbose_name='责任人'
+    )
+    responsible_dept = models.CharField('责任部门', max_length=100, blank=True)
+    snapshot_quantity = models.DecimalField('盘点基准账面数量', max_digits=12, decimal_places=2)
+    counted_quantity = models.DecimalField('实盘数量', max_digits=12, decimal_places=2)
+    snapshot_at = models.DateTimeField('快照时间', auto_now_add=True)
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='investigating')
+    conclusion = models.TextField('调查结论', blank=True)
+    close_baseline_quantity = models.DecimalField(
+        '结案时账面数量', max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    baseline_changed = models.BooleanField('结案时基准已变化', default=False)
+    cancel_reason = models.TextField('作废原因', blank=True)
+    revoke_reason = models.TextField('撤销原因', blank=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='created_investigations', verbose_name='创建人'
+    )
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    closed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='closed_investigations', verbose_name='批准人'
+    )
+    closed_at = models.DateTimeField('结案时间', null=True, blank=True)
+    revoked_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='revoked_investigations', verbose_name='撤销人'
+    )
+    revoked_at = models.DateTimeField('撤销时间', null=True, blank=True)
+
+    class Meta:
+        db_table = 'wh_stocktake_investigation'
+        verbose_name = '盘点差异调查单'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.order_no} - {self.goods.name}"
+
+    @property
+    def difference(self):
+        """盘点差异（实盘数量 - 基准账面数量）"""
+        return self.counted_quantity - self.snapshot_quantity
+
+
+class InvestigationNote(models.Model):
+    """调查过程记录模型（原因/证据/复核意见，仅可追加）"""
+    TYPE_CHOICES = [
+        ('reason', '原因分析'),
+        ('evidence', '证据材料'),
+        ('review', '复核意见'),
+    ]
+
+    investigation = models.ForeignKey(
+        StocktakeInvestigation, on_delete=models.CASCADE,
+        related_name='notes', verbose_name='调查单'
+    )
+    type = models.CharField('记录类型', max_length=20, choices=TYPE_CHOICES)
+    content = models.TextField('内容')
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='investigation_notes', verbose_name='记录人'
+    )
+    created_at = models.DateTimeField('记录时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_investigation_note'
+        verbose_name = '调查过程记录'
+        verbose_name_plural = verbose_name
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.investigation.order_no} - {self.get_type_display()}"
+
+
+class StockAdjustment(models.Model):
+    """库存调整分录模型（独立分录，创建后不可修改）"""
+    TYPE_CHOICES = [
+        ('stocktake', '盘点调整'),
+        ('reversal', '撤销冲回'),
+    ]
+
+    investigation = models.ForeignKey(
+        StocktakeInvestigation, on_delete=models.PROTECT,
+        related_name='adjustments', verbose_name='调查单'
+    )
+    goods = models.ForeignKey(
+        Goods, on_delete=models.PROTECT,
+        related_name='stock_adjustments', verbose_name='货物'
+    )
+    type = models.CharField('分录类型', max_length=20, choices=TYPE_CHOICES)
+    quantity = models.DecimalField('调整数量', max_digits=12, decimal_places=2)
+    before_quantity = models.DecimalField('调整前数量', max_digits=12, decimal_places=2)
+    after_quantity = models.DecimalField('调整后数量', max_digits=12, decimal_places=2)
+    reverses = models.ForeignKey(
+        'self', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reversed_by', verbose_name='被冲回分录'
+    )
+    operator = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='stock_adjustments', verbose_name='操作人'
+    )
+    remark = models.TextField('备注', blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_stock_adjustment'
+        verbose_name = '库存调整分录'
+        verbose_name_plural = verbose_name
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.goods.name} - {self.get_type_display()} - {self.quantity}"
+
+
 class Approval(models.Model):
     """审批记录模型"""
     STATUS_CHOICES = [
